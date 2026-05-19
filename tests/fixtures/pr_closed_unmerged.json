@@ -1,0 +1,18 @@
+{
+  "action": "closed",
+  "number": 43,
+  "pull_request": {
+    "number": 43,
+    "title": "QF-13: experiment",
+    "body": "Closes [QF-13].\n",
+    "draft": false,
+    "merged": false,
+    "merged_at": null,
+    "html_url": "https://github.com/octocat/hello-world/pull/43",
+    "user": { "login": "octocat" }
+  },
+  "repository": {
+    "full_name": "octocat/hello-world"
+  },
+  "sender": { "login": "octocat" }
+}

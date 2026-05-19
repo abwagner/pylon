@@ -1,0 +1,37 @@
+# pylon config — committed (no secrets here; secrets live in env).
+# Project list and state UUIDs are auto-discovered from Plane at runtime.
+# To make pylon handle a new project: just create it in Plane with the named
+# states below. No pylon restart needed for new projects (cache loads lazily).
+# To pick up renamed projects or new states in an existing project: restart pylon.
+
+plane_base_url: https://plane.example.com   # your Plane CE base URL
+plane_workspace: your-workspace-slug         # your Plane workspace slug
+
+# Maps each PR-driven action to a Plane state name. Names are matched
+# case-insensitively against each project's states. A project that's
+# missing one of these state names will have that transition logged
+# and skipped — pylon will keep operating on other actions / projects.
+state_machine:
+  opened_draft: In Progress
+  opened_ready: In Review
+  ready_for_review: In Review
+  converted_to_draft: In Progress
+  merged: Done
+  # When a PR is closed without merging, only revert state if it's currently
+  # `if_state`; otherwise leave state alone. A comment with the PR URL is
+  # always posted on close-no-merge regardless.
+  closed_unmerged:
+    if_state: In Review
+    set_to: In Progress
+
+# Module-state reconciliation. When enabled (default), pylon reads each
+# work item's module memberships after applying a state transition,
+# and may update the module's `status` field:
+#   - `planned` / `backlog` → `in-progress` when any work item is in
+#     the started group.
+#   - any non-locked status → `completed` when every work item is in
+#     the completed or cancelled group (and the module has > 0 items).
+# `paused`, `completed`, and `cancelled` are treated as operator-managed
+# terminal states — never touched.
+modules:
+  enabled: true

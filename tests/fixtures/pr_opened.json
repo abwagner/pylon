@@ -1,0 +1,17 @@
+{
+  "action": "opened",
+  "number": 42,
+  "pull_request": {
+    "number": 42,
+    "title": "QF-12: add foo",
+    "body": "Closes [QF-12].\n\n## Summary\n- thing\n",
+    "draft": false,
+    "merged": false,
+    "html_url": "https://github.com/octocat/hello-world/pull/42",
+    "user": { "login": "octocat" }
+  },
+  "repository": {
+    "full_name": "octocat/hello-world"
+  },
+  "sender": { "login": "octocat" }
+}
