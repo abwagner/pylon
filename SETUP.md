@@ -12,9 +12,13 @@ projects are auto-discovered: adding a new project to Plane requires zero
 pylon redeploy, and the cache is rebuilt lazily on first reference
 ([src/resolver.py:69-90](src/resolver.py#L69-L90)).
 
-There is no per-project configuration. There is no allowlist. Any project
-pylon sees in the workspace is potentially in scope — refs whose prefix
-doesn't match any project are logged and skipped.
+There is no per-project configuration *inside pylon* and no allowlist. Any
+project pylon sees in the workspace is potentially in scope — refs whose
+prefix doesn't match any project are logged and skipped. But onboarding a
+project or repo does take a couple of out-of-pylon steps: each Plane
+project must have the state names pylon expects (see [Plane setup](#plane-setup) §3),
+and each GitHub repo needs its own `pull_request` webhook (see
+[GitHub setup](#github-setup)).
 
 ## Plane setup
 

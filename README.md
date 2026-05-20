@@ -102,12 +102,38 @@ Plane CE's REST API and webhook payloads have a handful of sharp edges that pylo
 
 ## Configuration
 
-Two layers:
+Two layers of pylon-side config:
 
 1. [config.yaml](config.yaml) (committed) — Plane base URL, workspace slug, and the state-machine policy (which Plane state name each PR action transitions to).
 2. `.env` (host-only, see [.env.example](.env.example)) — `PLANE_API_KEY`, `GITHUB_WEBHOOK_SECRET`, `CONFIG_PATH`, `LOG_LEVEL`.
 
-There's no per-project configuration. Pylon discovers projects and their state UUIDs from Plane at runtime and caches them for the lifetime of the process. To add a new project to pylon: just create it in Plane with the state names listed above. To rename or reorganize states in an existing project: restart pylon (`docker compose restart pylon`) so the cache reloads.
+There's no per-project config *inside* pylon — projects are auto-discovered from Plane and cached lazily on first reference; there is no allowlist. But onboarding a new project or repo does require a couple of out-of-pylon steps, covered in [Per-project setup](#per-project-setup) below: each Plane project must have the configured state names, and each GitHub repo needs its own `pull_request` webhook pointing at pylon.
+
+To rename or reorganize states in an existing Plane project: restart pylon (`docker compose restart pylon`) so the cache reloads. To add a brand-new Plane project that already uses the configured state names: nothing — the first matching PR reference triggers a lazy cache load.
+
+## Per-project setup
+
+There's no pylon-side allowlist, but two out-of-pylon prerequisites apply each time you add a Plane project or a GitHub repo:
+
+### Plane state names (per project)
+
+Each project pylon handles must expose the state names declared in [config.yaml](config.yaml)'s `state_machine:` block — `In Progress`, `In Review`, and `Done` by default. Matching is case-insensitive ([src/resolver.py:49](src/resolver.py#L49)). A project missing one of these names has *that one transition* logged and skipped, not failed, and pylon keeps operating on other transitions and projects ([src/handler.py:131-143](src/handler.py#L131-L143)).
+
+Plane CE's stock state template ships with `Backlog / Todo / In Progress / Done / Cancelled` — note that **"In Review" is not in the default set** and typically needs to be added in the project's state settings before pylon's full lifecycle works for that project.
+
+### GitHub webhook (per repository)
+
+GitHub org-level webhooks can't subscribe to `pull_request` events, so pylon's GitHub webhook is configured **per repository**. For each repo whose PRs should drive Plane transitions:
+
+1. Repo → **Settings** → **Webhooks** → **Add webhook**.
+2. **Payload URL:** `https://your-pylon-host/webhook/github`
+3. **Content type:** `application/json`
+4. **Secret:** the same value as `GITHUB_WEBHOOK_SECRET` in your pylon `.env`. All repos pointing at one pylon instance share the same secret.
+5. **Events:** **Let me select individual events** → check only **Pull requests**. Other event types are ignored ([src/main.py:118-120](src/main.py#L118-L120)).
+
+Pylon verifies the `X-Hub-Signature-256` HMAC against `GITHUB_WEBHOOK_SECRET` on every delivery.
+
+See [SETUP.md](SETUP.md) for the full operator walkthrough including the optional Plane → pylon webhook for module reconciliation from non-PR sources.
 
 ## Local development
 
