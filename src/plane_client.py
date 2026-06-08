@@ -7,13 +7,30 @@ via paginated list scans. Performance is fine: each project has tens of items,
 each webhook fires a handful of lookups, and Plane caches its own list responses.
 """
 
+import asyncio
 import logging
+import random
 from typing import Any
 
 import httpx
 
 
 logger = logging.getLogger(__name__)
+
+
+# HTTP status codes worth retrying: 429 (rate limited) plus the 5xx
+# family (transient server-side faults). A self-hosted Plane CE under a
+# rapid batch-merge burst emits exactly these when its API saturates —
+# the failure mode that previously dropped ticket transitions for good.
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Exponential backoff with full jitter. Defaults are deliberately
+# modest — pylon runs inside a synchronous-feeling webhook handler, so
+# total worst-case wait stays a few seconds. GitHub's own delivery
+# retry is the outer safety net beyond this.
+_MAX_ATTEMPTS = 4
+_BACKOFF_BASE = 0.5  # seconds
+_BACKOFF_CAP = 8.0  # seconds
 
 
 class PlaneClient:
@@ -40,18 +57,63 @@ class PlaneClient:
     def _project_url(self, project_id: str) -> str:
         return f"{self._workspace_url()}/projects/{project_id}"
 
+    async def _send(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Issue a request, retrying transient failures (429 / 5xx /
+        network timeouts) with jittered exponential backoff.
+
+        Returns the final :class:`httpx.Response` without raising for
+        status — the caller still runs it through :func:`_raise_with_body`
+        so a non-retryable 4xx (or an exhausted-retry 5xx) surfaces with
+        the Plane response body in the log. Only the network-error path
+        re-raises directly, because there's no response to hand back.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                resp = await self._client.request(method, url, **kwargs)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_exc = exc
+                if attempt == _MAX_ATTEMPTS:
+                    logger.error(
+                        "Plane API %s %s failed after %d attempts: %r",
+                        method, url, attempt, exc,
+                    )
+                    raise
+                delay = _backoff_delay(attempt)
+                logger.warning(
+                    "Plane API %s %s network error (attempt %d/%d): %r; retrying in %.2fs",
+                    method, url, attempt, _MAX_ATTEMPTS, exc, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code in _RETRY_STATUSES and attempt < _MAX_ATTEMPTS:
+                delay = _retry_after(resp) or _backoff_delay(attempt)
+                logger.warning(
+                    "Plane API %s %s -> %d (attempt %d/%d); retrying in %.2fs",
+                    method, url, resp.status_code, attempt, _MAX_ATTEMPTS, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            return resp
+
+        # Unreachable: the loop either returns a response or raises.
+        assert last_exc is not None
+        raise last_exc
+
     async def _get(self, url: str, **kwargs) -> httpx.Response:
-        resp = await self._client.get(url, **kwargs)
+        resp = await self._send("GET", url, **kwargs)
         _raise_with_body(resp, "GET", url)
         return resp
 
     async def _post(self, url: str, **kwargs) -> httpx.Response:
-        resp = await self._client.post(url, **kwargs)
+        resp = await self._send("POST", url, **kwargs)
         _raise_with_body(resp, "POST", url)
         return resp
 
     async def _patch(self, url: str, **kwargs) -> httpx.Response:
-        resp = await self._client.patch(url, **kwargs)
+        resp = await self._send("PATCH", url, **kwargs)
         _raise_with_body(resp, "PATCH", url)
         return resp
 
@@ -155,7 +217,7 @@ class PlaneClient:
     async def get_module(self, project_id: str, module_id: str) -> dict | None:
         """Return the module record, or None if it doesn't exist."""
         url = f"{self._project_url(project_id)}/modules/{module_id}/"
-        resp = await self._client.get(url)
+        resp = await self._send("GET", url)
         if resp.status_code == 404:
             return None
         _raise_with_body(resp, "GET", url)
@@ -193,6 +255,31 @@ class PlaneClient:
         plain string — no UUID lookup needed."""
         url = f"{self._project_url(project_id)}/modules/{module_id}/"
         await self._patch(url, json={"status": status})
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Full-jitter exponential backoff: random point in
+    ``[0, min(cap, base * 2**(attempt-1))]``. Jitter spreads a herd of
+    concurrent retriers (a batch-merge fans out many webhooks at once)
+    so they don't re-collide in lockstep."""
+    ceiling = min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** (attempt - 1)))
+    return random.uniform(0, ceiling)
+
+
+def _retry_after(resp: httpx.Response) -> float | None:
+    """Honour a ``Retry-After`` header (delta-seconds form) when Plane
+    sends one on a 429. Returns None for the absent/unparseable/HTTP-date
+    forms — the caller falls back to jittered backoff."""
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        secs = float(raw.strip())
+    except ValueError:
+        return None
+    if secs < 0:
+        return None
+    return min(secs, _BACKOFF_CAP)
 
 
 def _raise_with_body(resp: httpx.Response, method: str, url: str) -> None:

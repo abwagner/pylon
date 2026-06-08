@@ -152,6 +152,26 @@ async def github_webhook(
         status,
         [str(r) for r in event.refs],
     )
+
+    if status == "handler_error":
+        # Return a non-2xx so GitHub's built-in webhook delivery retry
+        # re-runs this event. Previously the handler swallowed every
+        # failure and still answered 200, so a transient Plane-API blip
+        # (429/timeout during a batch-merge burst) silently dropped the
+        # ticket transition forever — GitHub only retries on non-2xx /
+        # timeout. The handler's mutations are idempotent on replay
+        # (state PATCH is set-to-target, links dedup), so a retry is
+        # safe. 503 signals "transient, try again".
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": status,
+                "action": event.action,
+                "pr": event.number,
+                "refs": [str(r) for r in event.refs],
+            },
+        )
+
     return {
         "status": status,
         "action": event.action,

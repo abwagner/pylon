@@ -40,6 +40,13 @@ from .resolver import ProjectStates, Resolver
 logger = logging.getLogger(__name__)
 
 
+class PullRequestHandlerError(Exception):
+    """Raised by :func:`handle_pull_request` when one or more refs
+    failed to apply. Signals the webhook route to return a non-2xx so
+    GitHub retries the delivery — the path that recovers transient
+    Plane-API failures during batch-merge bursts."""
+
+
 class PlaneAPI(Protocol):
     async def get_work_item_by_sequence(
         self, project_id: str, sequence: int
@@ -73,12 +80,32 @@ async def handle_pull_request(
         logger.info("PR #%s has no XX-N refs; nothing to do", event.number)
         return
 
+    failed: list[PRRef] = []
     for ref in event.refs:
         try:
             await _apply_ref(event, ref, cfg, plane, resolver)
         except Exception:
-            # One bad ref shouldn't stop us from processing the others.
+            # One bad ref shouldn't stop us from processing the others,
+            # but we DO record the failure: a swallowed-and-forgotten
+            # ref is how a transient Plane-API blip (429/timeout under a
+            # batch-merge burst) turned into permanent state drift —
+            # the ticket never reached its merged state and nothing
+            # retried. We log here, finish the other refs, then re-raise
+            # below so main.py can return a non-2xx and let GitHub's
+            # built-in delivery retry recover the transient failure.
             logger.exception("handler error processing ref %s in PR #%s", ref, event.number)
+            failed.append(ref)
+
+    if failed:
+        # The mutations are idempotent on replay (state PATCH is a
+        # set-to-target, add_link dedups), so signalling a retry is
+        # safe. Module reconciliation failures are deliberately NOT
+        # surfaced here — see _apply_ref — because the ticket-state
+        # work that matters already landed.
+        raise PullRequestHandlerError(
+            f"{len(failed)}/{len(event.refs)} ref(s) failed for PR #{event.number}: "
+            f"{', '.join(str(r) for r in failed)}"
+        )
 
 
 async def _apply_ref(

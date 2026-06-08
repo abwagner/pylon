@@ -1,19 +1,34 @@
+import asyncio
+
 from src.resolver import ProjectStates, Resolver
 
 
 class FakePlane:
-    def __init__(self, projects: list[dict], states: dict[str, list[dict]]):
+    def __init__(
+        self,
+        projects: list[dict],
+        states: dict[str, list[dict]],
+        *,
+        fetch_delay: float = 0.0,
+    ):
         self.projects = projects
         self.states = states
         self.list_projects_calls = 0
         self.list_states_calls: dict[str, int] = {}
+        # An artificial await point lets concurrent callers pile up
+        # inside the fetch — exposing any missing population lock.
+        self._fetch_delay = fetch_delay
 
     async def list_projects(self) -> list[dict]:
         self.list_projects_calls += 1
+        if self._fetch_delay:
+            await asyncio.sleep(self._fetch_delay)
         return self.projects
 
     async def list_states(self, project_id: str) -> list[dict]:
         self.list_states_calls[project_id] = self.list_states_calls.get(project_id, 0) + 1
+        if self._fetch_delay:
+            await asyncio.sleep(self._fetch_delay)
         return self.states.get(project_id, [])
 
 
@@ -42,6 +57,28 @@ async def test_project_uuid_unknown_returns_none() -> None:
     plane = FakePlane(PROJECTS, {})
     resolver = Resolver(plane)
     assert await resolver.project_uuid("WEB") is None
+
+
+async def test_concurrent_cold_project_lookups_fetch_once() -> None:
+    """Many webhooks hitting a cold cache at once (a batch-merge burst)
+    must collapse to a SINGLE list_projects call. Without the
+    population lock each concurrent first-hit re-fetched — a
+    self-inflicted thundering herd on the very Plane API we're trying
+    not to overrun."""
+    plane = FakePlane(PROJECTS, {}, fetch_delay=0.01)
+    resolver = Resolver(plane)
+    results = await asyncio.gather(*(resolver.project_uuid("QF") for _ in range(20)))
+    assert all(r == "uuid-qf" for r in results)
+    assert plane.list_projects_calls == 1
+
+
+async def test_concurrent_cold_state_lookups_fetch_once_per_project() -> None:
+    plane = FakePlane(PROJECTS, {"uuid-qf": STATES_QF}, fetch_delay=0.01)
+    resolver = Resolver(plane)
+    results = await asyncio.gather(*(resolver.states("uuid-qf") for _ in range(20)))
+    # Same cached instance handed to everyone, fetched exactly once.
+    assert all(r is results[0] for r in results)
+    assert plane.list_states_calls == {"uuid-qf": 1}
 
 
 async def test_states_caches_per_project() -> None:

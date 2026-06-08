@@ -9,6 +9,7 @@ and `docker compose restart pylon` is one command.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Protocol
 
@@ -61,30 +62,72 @@ class ProjectStates:
 
 
 class Resolver:
+    """Lazily caches project + state lookups, shared across all
+    concurrent webhook handlers.
+
+    Cache population is guarded by ``asyncio.Lock``s using the
+    double-checked pattern. Without them, a batch-merge that fans out
+    many webhooks against a cold cache had every concurrent first-hit
+    re-fetch ``list_projects`` / ``list_states`` simultaneously — a
+    self-inflicted burst on the same Plane API the handler is trying
+    not to overrun. The lock collapses that to one fetch; everyone
+    else awaits it and reads the populated cache.
+    """
+
     def __init__(self, plane: _PlaneAPI):
         self._plane = plane
         self._projects: dict[str, str] | None = None
         self._states: dict[str, ProjectStates] = {}
+        self._projects_lock = asyncio.Lock()
+        # One lock per project for state population, created on demand
+        # under _state_locks_guard so distinct projects don't serialize
+        # against each other.
+        self._state_locks: dict[str, asyncio.Lock] = {}
+        self._state_locks_guard = asyncio.Lock()
 
     async def project_uuid(self, identifier: str) -> str | None:
         if self._projects is None:
-            raw = await self._plane.list_projects()
-            self._projects = {
-                p["identifier"]: p["id"]
-                for p in raw
-                if p.get("identifier") and p.get("id")
-            }
-            logger.info("loaded %d projects: %s", len(self._projects), sorted(self._projects))
+            async with self._projects_lock:
+                # Re-check: another coroutine may have populated the
+                # cache while we waited for the lock.
+                if self._projects is None:
+                    raw = await self._plane.list_projects()
+                    self._projects = {
+                        p["identifier"]: p["id"]
+                        for p in raw
+                        if p.get("identifier") and p.get("id")
+                    }
+                    logger.info(
+                        "loaded %d projects: %s",
+                        len(self._projects),
+                        sorted(self._projects),
+                    )
         return self._projects.get(identifier)
 
     async def states(self, project_uuid: str) -> ProjectStates:
-        if project_uuid not in self._states:
+        cached = self._states.get(project_uuid)
+        if cached is not None:
+            return cached
+        lock = await self._state_lock_for(project_uuid)
+        async with lock:
+            cached = self._states.get(project_uuid)
+            if cached is not None:
+                return cached
             raw = await self._plane.list_states(project_uuid)
-            self._states[project_uuid] = ProjectStates(raw)
+            states = ProjectStates(raw)
+            self._states[project_uuid] = states
             logger.info(
                 "loaded %d states for project %s: %s",
-                len(self._states[project_uuid].by_uuid_to_name),
+                len(states.by_uuid_to_name),
                 project_uuid,
-                sorted(self._states[project_uuid].by_uuid_to_name.values()),
+                sorted(states.by_uuid_to_name.values()),
             )
-        return self._states[project_uuid]
+            return states
+
+    async def _state_lock_for(self, project_uuid: str) -> asyncio.Lock:
+        async with self._state_locks_guard:
+            lock = self._state_locks.get(project_uuid)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._state_locks[project_uuid] = lock
+            return lock

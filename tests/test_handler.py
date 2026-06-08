@@ -4,7 +4,11 @@ import pytest
 
 from src.config import ClosedUnmergedRule, Config, ModulesConfig, StateMachine
 from src.github_events import parse_pull_request
-from src.handler import handle_plane_event, handle_pull_request
+from src.handler import (
+    PullRequestHandlerError,
+    handle_plane_event,
+    handle_pull_request,
+)
 from src.plane_events import parse_plane_event
 from src.resolver import Resolver
 
@@ -272,6 +276,85 @@ async def test_cross_project_refs_route_independently(pr_opened: dict, cfg: Conf
     await handle_pull_request(event, cfg, plane, Resolver(plane))
     assert ("update_state", "wi-12", "qf-review") in plane.calls
     assert ("update_state", "wi-pt-1", "qf-review") in plane.calls
+
+
+# ── Transient-failure propagation (regression: silent state drift) ──
+
+
+async def test_failing_ref_raises_handler_error(pr_merged: dict, cfg: Config) -> None:
+    """A transient Plane-API failure on update_state must NOT be
+    swallowed-and-forgotten — it has to propagate so the webhook route
+    can answer non-2xx and let GitHub retry. This is the root-cause
+    fix: previously the per-ref try/except ate the exception and the
+    merged→Done transition vanished forever."""
+    plane = FakePlane({(PROJECT_UUID, 12): _wi("wi-12", 12, "qf-review")})
+
+    async def boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("simulated Plane 429 under batch-merge load")
+
+    plane.update_state = boom  # type: ignore[method-assign]
+
+    event = parse_pull_request(pr_merged)
+    with pytest.raises(PullRequestHandlerError):
+        await handle_pull_request(event, cfg, plane, Resolver(plane))
+
+
+async def test_bundle_pr_applies_good_ref_then_raises_for_bad_ref(
+    pr_merged: dict, cfg: Config
+) -> None:
+    """One bad ref shouldn't block the others — but the run must still
+    end in a raise so GitHub retries the whole delivery. On replay the
+    already-applied good ref is idempotent (state set-to-target)."""
+    pr_merged["pull_request"]["title"] = "QF-12 QF-13: bundle merge"
+    plane = FakePlane(
+        {
+            (PROJECT_UUID, 12): _wi("wi-12", 12, "qf-review"),
+            (PROJECT_UUID, 13): _wi("wi-13", 13, "qf-review"),
+        }
+    )
+
+    original = plane.update_state
+
+    async def maybe_boom(project_id: str, work_item_id: str, state_uuid: str) -> None:
+        if work_item_id == "wi-13":
+            raise RuntimeError("transient Plane outage")
+        await original(project_id, work_item_id, state_uuid)
+
+    plane.update_state = maybe_boom  # type: ignore[method-assign]
+
+    event = parse_pull_request(pr_merged)
+    with pytest.raises(PullRequestHandlerError):
+        await handle_pull_request(event, cfg, plane, Resolver(plane))
+
+    # The healthy ref still landed before the raise.
+    assert ("update_state", "wi-12", "qf-testing") in plane.calls
+
+
+async def test_module_reconcile_failure_does_not_raise_handler_error(
+    pr_opened: dict,
+) -> None:
+    """The flip side of the propagation fix: a module-reconcile failure
+    must STILL be swallowed (the ticket-state work that matters already
+    landed) — it must not trigger a spurious GitHub retry."""
+    cfg = _config(modules_enabled=True)
+    pr_opened["pull_request"]["title"] = "QF-12: kickoff"
+    plane = FakePlane(
+        work_items={
+            (PROJECT_UUID, 12): _wi_with_modules("wi-12", 12, "qf-todo", ["mod-I"]),
+        },
+        modules={"mod-I": _module("mod-I", "planned")},
+        module_items={"mod-I": [{"id": "wi-12", "state": "qf-todo"}]},
+    )
+
+    async def boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("simulated module outage")
+
+    plane.update_module_status = boom  # type: ignore[method-assign]
+
+    event = parse_pull_request(pr_opened)
+    # No raise — state landed; module failure stays contained.
+    await handle_pull_request(event, cfg, plane, Resolver(plane))
+    assert ("update_state", "wi-12", "qf-review") in plane.calls
 
 
 # ── Module-state reconciliation ────────────────────────────────────
