@@ -55,6 +55,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "accept unsigned deliveries. Set the env var for signature "
             "verification."
         )
+    # FORGEJO_WEBHOOK_SECRET is optional too — when unset, the Forgejo
+    # webhook route accepts unsigned deliveries with a startup warning,
+    # so pylon still boots before the forge is wired up.
+    app.state.forgejo_webhook_secret = os.environ.get("FORGEJO_WEBHOOK_SECRET", "")
+    if not app.state.forgejo_webhook_secret:
+        logger.warning(
+            "FORGEJO_WEBHOOK_SECRET is unset — Forgejo webhook route will "
+            "accept unsigned deliveries. Set the env var for signature "
+            "verification."
+        )
     app.state.last_webhook = {"at": None, "event": None, "status": None}
     app.state.webhook_count = 0
     logger.info(
@@ -192,6 +202,109 @@ async def github_webhook(
 # route catches everything else (UI edits, MCP/REST calls, future
 # automations). Both feed the same shared _reconcile_module logic in
 # handler.py.
+
+
+# ── Forgejo webhook ─────────────────────────────────────────────────
+#
+# Forgejo (git.swagner.tech) fires the same pull_request events as GitHub,
+# with a GitHub-compatible payload and HMAC (X-Hub-Signature-256). We reuse
+# the GitHub parser (parse_pull_request) and the shared PR→Plane handler
+# verbatim — only the event header (X-Forgejo-Event, falling back to the
+# Gitea-compatible X-Gitea-Event) and the secret differ. The leading-[QF-NN]
+# title-prefix parser is identical. See FORGEJO_MIGRATION_PLAN.md.
+
+
+@app.post("/webhook/forgejo")
+async def forgejo_webhook(
+    request: Request,
+    x_forgejo_event: str = Header(default=""),
+    x_gitea_event: str = Header(default=""),
+    x_hub_signature_256: str | None = Header(default=None),
+) -> dict[str, object]:
+    body = await request.body()
+    event_type = x_forgejo_event or x_gitea_event
+    request.app.state.webhook_count += 1
+    request.app.state.last_webhook = {
+        "at": time.time(),
+        "event": event_type,
+        "source": "forgejo",
+        "status": "received",
+    }
+    logger.info(
+        "forgejo webhook received event=%s body_bytes=%d",
+        event_type or "<none>",
+        len(body),
+    )
+
+    secret = request.app.state.forgejo_webhook_secret
+    if secret and not verify(secret, body, x_hub_signature_256):
+        request.app.state.last_webhook["status"] = "bad_signature"
+        logger.warning(
+            "rejected forgejo webhook: bad signature event=%s", event_type
+        )
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    if event_type == "ping":
+        request.app.state.last_webhook["status"] = "pong"
+        logger.info("forgejo ping ack")
+        return {"status": "pong"}
+    if event_type != "pull_request":
+        request.app.state.last_webhook["status"] = "ignored_event_type"
+        return {"status": "ignored", "event": event_type}
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        request.app.state.last_webhook["status"] = "bad_json"
+        raise HTTPException(status_code=400, detail=f"invalid json: {e}")
+
+    event = parse_pull_request(payload)
+    logger.info(
+        "forgejo pull_request action=%s pr=#%s refs=%s repo=%s",
+        event.action,
+        event.number,
+        [str(r) for r in event.refs],
+        (payload.get("repository") or {}).get("full_name") or "<unknown>",
+    )
+    try:
+        await handle_pull_request(
+            event,
+            request.app.state.cfg,
+            request.app.state.plane,
+            request.app.state.resolver,
+        )
+        status = "processed"
+    except Exception:
+        logger.exception("forgejo handler raised on pr=#%s", event.number)
+        status = "handler_error"
+
+    request.app.state.last_webhook["status"] = status
+    logger.info(
+        "forgejo webhook done pr=#%s status=%s refs=%s",
+        event.number,
+        status,
+        [str(r) for r in event.refs],
+    )
+
+    if status == "handler_error":
+        # Non-2xx so Forgejo's webhook delivery retry re-runs the event;
+        # handler mutations are idempotent on replay (same as the GitHub route).
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": status,
+                "action": event.action,
+                "pr": event.number,
+                "refs": [str(r) for r in event.refs],
+            },
+        )
+
+    return {
+        "status": status,
+        "action": event.action,
+        "pr": event.number,
+        "refs": [str(r) for r in event.refs],
+    }
 
 
 @app.post("/webhook/plane")
